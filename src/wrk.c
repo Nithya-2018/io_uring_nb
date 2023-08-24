@@ -56,49 +56,10 @@ static void handler(int sig) {
 }
 
 void *thread_io_uring_nb(void *data);
-
-
-void prep_connect(struct io_uring_sqe *sqe, struct connection *conn) {
-    io_uring_prep_connect(sqe, conn->fd, (struct sockaddr *)&conn->addr, sizeof(conn->addr));
-    //printf("Connection has been established successfully\n");
-    io_uring_sqe_set_data(sqe, conn);
-    //printf("Connection has been established successfully for %d\n\n", conn->fd);
-}
-
-void prep_send(struct io_uring_sqe *sqe, struct connection *conn) {
-   // printf("Inside send method\n");
-    if(!conn->written) {
-        conn->start   = time_us();
-        conn->pending = cfg.pipeline;
-    }
-    conn->pending = cfg.pipeline;
-    const char *msg = "GET / HTTP/1.1\r\nHost: 127.0.0.1\r\n\r\n";
-    io_uring_prep_send(sqe, conn->fd, msg, strlen(msg), MSG_DONTWAIT);
-    //io_uring_prep_send(sqe, conn->fd, conn->request, strlen(conn->request), MSG_DONTWAIT);
-    //req_parse_time = time_us();
-    //printf("Sent a send req for socket fd: %s\n", conn->request);
-    //printf("conn->pending : %d\n", conn->pending);
-    io_uring_sqe_set_data(sqe, conn);
-}
-
-void prep_read(struct io_uring_sqe *sqe, struct connection *conn) {
-    //printf("Inside receive method for %d\n", conn->fd);
-    conn->state = READ;
-    memset(conn->buf, 0, sizeof(conn->buf));
-    io_uring_prep_read(sqe, conn->fd, conn->buf, RECVBUF, 0);
-    io_uring_sqe_set_data(sqe, conn);
-}
-
-void initialize_connection(struct connection *conn, struct io_uring *ring) {
-    //printf("Inside Initialise Connection Method\n");
-    conn->fd = socket(AF_INET, SOCK_STREAM | SOCK_NONBLOCK, 0);
-    conn->state = CONNECT;
-    conn->addr.sin_family = AF_INET;
-    conn->addr.sin_port = htons(conn->thread->port);
-    inet_pton(AF_INET, cfg.host, &(conn->addr.sin_addr));
-    struct io_uring_sqe *sqe = io_uring_get_sqe(ring);
-    prep_connect(sqe, conn);
-}
+void prep_connect(struct io_uring_sqe *sqe, struct connection *conn);
+void prep_send(struct io_uring_sqe *sqe, struct connection *conn);
+void prep_read(struct io_uring_sqe *sqe, struct connection *conn);
+void initialize_connection(struct connection *conn, struct io_uring *ring);
 
 static void usage() {
     printf("Usage: wrk <options> <url>                            \n"
@@ -166,7 +127,6 @@ int main(int argc, char **argv) {
         t->loop        = aeCreateEventLoop(10 + cfg.connections * 3);
         t->connections = cfg.connections / cfg.threads;
         t->port = atoi(port);
-
         t->L = script_create(cfg.script, url, headers);
         script_init(L, t, argc - optind, &argv[optind]);
 
@@ -217,8 +177,6 @@ int main(int argc, char **argv) {
 
         complete += t->complete;
         bytes    += t->bytes;
-
-        printf("complete : %ld  bytes: %ld\n", complete, bytes);
 
         errors.connect += t->errors.connect;
         errors.read    += t->errors.read;
@@ -271,15 +229,14 @@ void *thread_io_uring_nb(void *arg) {
     thread *thread = arg;
     struct io_uring ring; 
     if (io_uring_queue_init(QUEUE_DEPTH, &ring, 0) < 0) {
-    perror("Failed to initialize io_uring");
-    return NULL;
-}
+        perror("Failed to initialize io_uring");
+        return NULL;
+    }
 
     char *request = NULL;
     size_t length = 0;
 
     if (!cfg.dynamic) {
-        printf("Inside cfg.dynamic\n");
         script_request(thread->L, &request, &length);
     }
 
@@ -292,7 +249,6 @@ void *thread_io_uring_nb(void *arg) {
         c->request = request;
         c->length  = length;
         c->delayed = cfg.delay;
-        //printf("c->delsyed: %d \n", cfg.delay);
 
         int sockfd = socket(AF_INET, SOCK_STREAM | SOCK_NONBLOCK, 0);
         if (sockfd == -1) {
@@ -310,48 +266,35 @@ void *thread_io_uring_nb(void *arg) {
 
     }
     io_uring_submit(&ring);
-    int j = 0;
-
+    
     clock_t start_time = clock();
-
     thread->start = time_us();
-    //thread.start = time_us();
     uint64_t last_record_time = time_us();
-
-
 
     while(1) {
         for(int k = 0 ; k < cfg.connections; k++) {
                 struct io_uring_cqe *cqe;
-                int x = io_uring_wait_cqe(&ring, &cqe);
+                io_uring_wait_cqe(&ring, &cqe);
                 struct connection *conn = io_uring_cqe_get_data(cqe);
 
                 switch(conn->state) {
                     case CONNECT:
-                        //printf("%d\n", conn->fd);
                         io_uring_cqe_seen(&ring, cqe);
                         http_parser_init(&conn->parser, HTTP_RESPONSE);
-                        //printf("http parser initiated for connection %d\n", conn->fd);
                         conn->state = SEND;
                         struct io_uring_sqe *sqe = io_uring_get_sqe(&ring);
                         prep_send(sqe, conn);
                         break;
                     case SEND:
-                        // printf("Inside sending state for %d\n", conn->fd);
                         io_uring_cqe_seen(&ring, cqe);
                         sqe = io_uring_get_sqe(&ring);
                         prep_read(sqe, conn);
                         break;
                     case READ:
-                        // printf("Inside READ state\n");
-                        // printf("c->pending : %ld, pipeline : %ld\n", conn->pending, cfg.pipeline);
                         io_uring_cqe_seen(&ring, cqe);
-                        char *response = io_uring_cqe_get_data(cqe);
-                        // printf("parser settings %d", parser_settings.on_message_complete);
-                        // printf("Bytes : %d Conn fd : %d\n", cqe->res, conn->fd);
+                        io_uring_cqe_get_data(cqe);
                         size_t x = http_parser_execute(&conn->parser, &parser_settings, conn->buf, cqe->res);
-                        // total_bytes_read += cqe->res;
-                        if (cqe->res < 0)
+                        if (cqe->res < 0 || x < 0)
                         {
                             fprintf(stderr, "Connection failed with error: %s\n", strerror(-cqe->res));
                             thread->errors.connect++;
@@ -365,7 +308,6 @@ void *thread_io_uring_nb(void *arg) {
                             if (y < 0)
                             {
                                 printf("Error waiting for CQE after re-establishing connection\n");
-                                // fprintf(stderr, "Error waiting for CQE after re-establishing connection: %s\n", strerror(-x));
                             }
                         }
                         else if (cqe->res == RECVBUF)
@@ -376,7 +318,6 @@ void *thread_io_uring_nb(void *arg) {
                         }
                         else
                         {
-                            // conn->thread->bytes += cqe->res;
                             conn->state = SEND;
                             struct io_uring_sqe *sqe = io_uring_get_sqe(&ring);
                             prep_send(sqe, conn);
@@ -396,33 +337,57 @@ void *thread_io_uring_nb(void *arg) {
             {
                 uint64_t elapsed_ms = (current_time - thread->start) / 1000;
                 uint64_t requests = (thread->requests / (double) elapsed_ms) * 1000;
-                //printf("elapsed time: %ld\n", elapsed_ms);
-                //printf("Requests: %ld\n", thread->requests);
                 stats_record(statistics.requests, requests);
                 thread->start = time_us();
                 thread->requests = 0;
             }
             last_record_time = current_time;
         }
-        j++;
         clock_t current_time_2 = clock();
         double time_passed_in_seconds = ((double)(current_time_2 - start_time)) / CLOCKS_PER_SEC;
         
         if (time_passed_in_seconds >= cfg.duration)
         {
-            //printf("Total requests sent: %ld\n Total bytes read : %ld\n", request, total_bytes_read);
-            break; // Exit the loop
+            break;
         }
-        j++;
-
     }
 
-
-    printf("Connection created!\n");
     thread->start = time_us();
     io_uring_queue_exit(&ring);
-
     return NULL;
+}
+
+void prep_connect(struct io_uring_sqe *sqe, struct connection *conn) {
+    io_uring_prep_connect(sqe, conn->fd, (struct sockaddr *)&conn->addr, sizeof(conn->addr));
+    io_uring_sqe_set_data(sqe, conn);
+}
+
+void prep_send(struct io_uring_sqe *sqe, struct connection *conn) {
+    if(!conn->written) {
+        conn->start   = time_us();
+        conn->pending = cfg.pipeline;
+    }
+    conn->pending = cfg.pipeline;
+    const char *msg = "GET / HTTP/1.1\r\nHost: 127.0.0.1\r\n\r\n";
+    io_uring_prep_send(sqe, conn->fd, msg, strlen(msg), MSG_DONTWAIT);
+    io_uring_sqe_set_data(sqe, conn);
+}
+
+void prep_read(struct io_uring_sqe *sqe, struct connection *conn) {
+    conn->state = READ;
+    memset(conn->buf, 0, sizeof(conn->buf));
+    io_uring_prep_read(sqe, conn->fd, conn->buf, RECVBUF, 0);
+    io_uring_sqe_set_data(sqe, conn);
+}
+
+void initialize_connection(struct connection *conn, struct io_uring *ring) {
+    conn->fd = socket(AF_INET, SOCK_STREAM | SOCK_NONBLOCK, 0);
+    conn->state = CONNECT;
+    conn->addr.sin_family = AF_INET;
+    conn->addr.sin_port = htons(conn->thread->port);
+    inet_pton(AF_INET, cfg.host, &(conn->addr.sin_addr));
+    struct io_uring_sqe *sqe = io_uring_get_sqe(ring);
+    prep_connect(sqe, conn);
 }
 
 void *thread_main(void *arg) {
@@ -549,18 +514,16 @@ static int response_body(http_parser *parser, const char *at, size_t len) {
 
 static int response_complete(http_parser *parser) {
     connection *c = parser->data;
-    //printf("parser data: %s", parser->data);
     thread *thread = c->thread;
     uint64_t now = time_us();
     int status = parser->status_code;
     if(cfg.use_io) {
         thread->complete++;
         thread->requests++;
-
         if (--c->pending == 0) {
-        if (!stats_record(statistics.latency, now - c->start)) {
-            thread->errors.timeout++;
-        }
+            if (!stats_record(statistics.latency, now - c->start)) {
+                thread->errors.timeout++;
+            }
         }
         return 0;
     }
@@ -575,10 +538,6 @@ static int response_complete(http_parser *parser) {
         script_response(thread->L, status, &c->headers, &c->body);
         c->state = FIELD;
     }
-
-
-
-    //printf("c->pending: %ld\n", c->pending);
 
     if (--c->pending == 0) {
         if (!stats_record(statistics.latency, now - c->start)) {
@@ -604,7 +563,6 @@ static int response_complete(http_parser *parser) {
 
 static void socket_connected(aeEventLoop *loop, int fd, void *data, int mask) {
     connection *c = data;
-    //printf("%d \n", c->parser.content_length);
 
     switch (sock.connect(c, cfg.host)) {
         case OK:    break;
@@ -612,8 +570,6 @@ static void socket_connected(aeEventLoop *loop, int fd, void *data, int mask) {
         case RETRY: return;
     }
 
-
-    //printf("Parser init :%s\n", &c->parser.data);
     http_parser_init(&c->parser, HTTP_RESPONSE);
     c->written = 0;
 
@@ -632,18 +588,14 @@ static void socket_writeable(aeEventLoop *loop, int fd, void *data, int mask) {
     thread *thread = c->thread;
 
     if (c->delayed) {
-        //printf("Inside delayed writeable\n");
         uint64_t delay = script_delay(thread->L);
         aeDeleteFileEvent(loop, fd, AE_WRITABLE);
         aeCreateTimeEvent(loop, delay, delay_request, c, NULL);
         return;
     }
 
-
-
     if (!c->written) {
         if (cfg.dynamic) {
-            //printf("Inside dynamic writeable\n");
             script_request(thread->L, &c->request, &c->length);
         }
         c->start   = time_us();
@@ -662,7 +614,6 @@ static void socket_writeable(aeEventLoop *loop, int fd, void *data, int mask) {
 
     c->written += n;
     if (c->written == c->length) {
-        //printf("Inside last if loop\n");
         c->written = 0;
         aeDeleteFileEvent(loop, fd, AE_WRITABLE);
     }
@@ -684,7 +635,6 @@ static void socket_readable(aeEventLoop *loop, int fd, void *data, int mask) {
             case ERROR: goto error;
             case RETRY: return;
         }
-        //printf("n: %ld\n", n);
 
         if (http_parser_execute(&c->parser, &parser_settings, c->buf, n) != n) goto error;
         if (n == 0 && !http_body_is_final(&c->parser)) goto error;
@@ -772,7 +722,6 @@ static int parse_args(struct config *cfg, char **url, struct http_parser_url *pa
                 break;
             case 'i':
                 cfg->use_io = true;
-                printf("Testing worked\n");
                 break;
             case 'h':
             case '?':
